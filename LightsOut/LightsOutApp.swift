@@ -22,15 +22,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var contextMenuManager: ContextMenuManager!
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        print("🚀 [DEBUG] LightsOut app launching...")
+        #endif
+        
         popover = NSPopover()
         popover.behavior = .applicationDefined
         
         // Set up the status item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(named: "MenubarIcon")
+            let image = NSImage(named: "menubarIcon")
+            #if DEBUG
+            print("🖼️ [DEBUG] Loading menubar icon: \(image != nil ? "success" : "FAILED - image is nil")")
+            #endif
+            button.image = image
             button.action = #selector(handleClick(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            #if DEBUG
+            print("✅ [DEBUG] Status bar item configured successfully")
+            #endif
+        } else {
+            #if DEBUG
+            print("❌ [DEBUG] Failed to get status item button!")
+            #endif
         }
 
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
@@ -48,6 +63,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 //        #endif
         
         contextMenuManager = ContextMenuManager(updateController: updateController.updater, statusItem: statusItem)
+        
+        #if DEBUG
+        print("✅ [DEBUG] App launch complete. Displays loaded: \(displaysViewModel.displays.count)")
+        for display in displaysViewModel.displays {
+            print("   📺 \(display.name) (ID: \(display.id)) - State: \(display.state) - Primary: \(display.isPrimary)")
+        }
+        #endif
     }
 
     @objc func handleClick(_ sender: NSStatusBarButton) {
@@ -60,6 +82,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func togglePopover(_ sender: NSStatusBarButton) {
+        #if DEBUG
+        print("🔘 [DEBUG] Toggle popover - currently \(popover.isShown ? "shown" : "hidden")")
+        #endif
+        
         if popover.isShown {
             popover.performClose(sender)
         } else {
