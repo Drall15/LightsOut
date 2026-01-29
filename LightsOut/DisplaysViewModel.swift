@@ -13,37 +13,315 @@ class DisplaysViewModel: ObservableObject {
     private var gammaService = GammaUpdateService()
     private var arrengementCache = DisplayArrangementCacheService()
     
-    init() {
-        fetchDisplays()
+    // Auto-restore configuration
+    private let autoRestoreDelay: TimeInterval = 3.0 // seconds - configurable
+    private var autoRestoreWorkItem: DispatchWorkItem?
+    private var wasAutoRestored: Bool = false // Track if built-in was auto-restored
+    
+    // Helper for timestamped debug logging
+    private func timestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter.string(from: Date())
     }
     
-    func fetchDisplays() {
-        print("Fetching displays.")
+    // Persistent storage for built-in display ID
+    private let builtInDisplayIDKey = "LightsOut.BuiltInDisplayID"
+    private var savedBuiltInDisplayID: CGDirectDisplayID? {
+        get {
+            let id = UserDefaults.standard.integer(forKey: builtInDisplayIDKey)
+            return id > 0 ? CGDirectDisplayID(id) : nil
+        }
+        set {
+            if let id = newValue {
+                UserDefaults.standard.set(Int(id), forKey: builtInDisplayIDKey)
+            }
+        }
+    }
+    
+    init() {
+        fetchDisplays()
+        registerDisplayReconfigurationCallback()
+    }
+    
+    deinit {
+        CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, Unmanaged.passUnretained(self).toOpaque())
+        autoRestoreWorkItem?.cancel()
+    }
+    
+    // MARK: - Display Configuration Monitoring
+    
+    private func registerDisplayReconfigurationCallback() {
+        CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, Unmanaged.passUnretained(self).toOpaque())
+    }
+    
+    /// Built-in (internal) display if available
+    private var builtInDisplay: DisplayInfo? {
+        return displays.first { CGDisplayIsBuiltin($0.id) != 0 }
+    }
+    
+    /// Check if the built-in display is the only display and is currently disabled
+    private func shouldAutoRestoreBuiltInDisplay() -> Bool {
+        // Get all active physical displays from the system
         var displayCount: UInt32 = 0
         CGGetActiveDisplayList(0, nil, &displayCount)
         var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
         CGGetActiveDisplayList(displayCount, &activeDisplays, &displayCount)
         
+        // Check if we have a built-in display in our tracked list that is disabled
+        guard let builtIn = builtInDisplay else {
+            return false
+        }
+        
+        guard builtIn.state.isOff() else {
+            return false
+        }
+        
+        // Check if there are NO active external displays
+        // Note: When external displays are unplugged with internal disabled, macOS may create
+        // a temporary "headless" display. We need to detect this scenario.
+        let externalDisplays = activeDisplays.filter { displayID in
+            CGDisplayIsBuiltin(displayID) == 0
+        }
+        
+        // Check if any external displays are KNOWN/PHYSICAL (not headless/temporary)
+        // A headless display will not be in our tracked displays list with a real name
+        let hasPhysicalExternalDisplay = externalDisplays.contains { displayID in
+            // Check if this display is in our tracked list with a non-empty name
+            if let trackedDisplay = displays.first(where: { $0.id == displayID }) {
+                return trackedDisplay.state == .active && !trackedDisplay.name.isEmpty && trackedDisplay.name != "Display \(displayID)"
+            }
+            return false
+        }
+        
+        guard !hasPhysicalExternalDisplay else {
+            return false
+        }
+        
+        return true
+    }
+    
+    /// Auto-disable built-in display if it was auto-restored and external displays are now available
+    private func autoDisableBuiltInIfNeeded() {
+        guard wasAutoRestored,
+              let builtIn = builtInDisplay,
+              builtIn.state == .active else {
+            return
+        }
+        
+        // Check if we now have physical external displays
+        var displayCount: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &displayCount)
+        var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+        CGGetActiveDisplayList(displayCount, &activeDisplays, &displayCount)
+        
+        let hasPhysicalExternalDisplay = activeDisplays.contains { displayID in
+            guard CGDisplayIsBuiltin(displayID) == 0 else { return false }
+            
+            if let trackedDisplay = displays.first(where: { $0.id == displayID }) {
+                return trackedDisplay.state == .active && !trackedDisplay.name.isEmpty && trackedDisplay.name != "Display \(displayID)"
+            }
+            return false
+        }
+        
+        guard hasPhysicalExternalDisplay else {
+            return
+        }
+        
+        print("[\(timestamp())] Auto-disabling built-in display (external display reconnected)...")
+        
+        do {
+            try disconnectDisplay(display: builtIn)
+            wasAutoRestored = false
+            print("[\(timestamp())] ✅ Successfully auto-disabled built-in display.")
+        } catch {
+            print("[\(timestamp())] ❌ Failed to auto-disable built-in display: \(error)")
+        }
+    }
+    
+    /// Schedule auto-restore of built-in display after the configured delay
+    private func scheduleAutoRestoreIfNeeded() {
+        // Cancel any existing scheduled restore
+        autoRestoreWorkItem?.cancel()
+        
+        guard shouldAutoRestoreBuiltInDisplay() else {
+            return
+        }
+        
+        #if DEBUG
+        print("[\(timestamp())] ⏰ [DEBUG] Scheduling auto-restore of built-in display in \(autoRestoreDelay) seconds...")
+        #endif
+        
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            
+            #if DEBUG
+            let ts = self.timestamp()
+            print("[\(ts)] ⏰ [DEBUG] Timer fired! Re-checking auto-restore conditions...")
+            #endif
+            
+            // Re-check conditions before restoring
+            guard self.shouldAutoRestoreBuiltInDisplay(),
+                  let builtIn = self.builtInDisplay else {
+                #if DEBUG
+                print("[\(self.timestamp())] ⏰ [DEBUG] Auto-restore conditions no longer met, cancelling.")
+                #endif
+                return
+            }
+            
+            print("[\(self.timestamp())] Auto-restoring built-in display '\(builtIn.name)'...")
+            do {
+                try self.turnOnDisplay(display: builtIn)
+                self.wasAutoRestored = true
+                print("[\(self.timestamp())] ✅ Successfully auto-restored built-in display.")
+            } catch {
+                print("[\(self.timestamp())] ❌ Failed to auto-restore built-in display: \(error)")
+            }
+        }
+        
+        autoRestoreWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + autoRestoreDelay, execute: workItem)
+    }
+    
+    /// Called when display configuration changes
+    fileprivate func handleDisplayReconfiguration(display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
+        // Only respond after the reconfiguration is complete (not during begin)
+        guard !flags.contains(.beginConfigurationFlag) else { return }
+        
+        if flags.contains(.removeFlag) {
+            DispatchQueue.main.async { [weak self] in
+                self?.fetchDisplays()
+                self?.scheduleAutoRestoreIfNeeded()
+            }
+        } else if flags.contains(.addFlag) {
+            // If a display is added, cancel any pending auto-restore
+            autoRestoreWorkItem?.cancel()
+            autoRestoreWorkItem = nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.fetchDisplays()
+                
+                // If the built-in was auto-restored and we just added an external display, disable the built-in again
+                if self.wasAutoRestored {
+                    self.autoDisableBuiltInIfNeeded()
+                }
+            }
+        } else {
+            // For other configuration changes, update displays and check auto-restore
+            DispatchQueue.main.async { [weak self] in
+                self?.fetchDisplays()
+                self?.scheduleAutoRestoreIfNeeded()
+            }
+        }
+    }
+    
+    func fetchDisplays() {
+        #if DEBUG
+        print("📺 [DEBUG] Fetching displays...")
+        #endif
+        
+        // Get active displays
+        var activeCount: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &activeCount)
+        var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(activeCount))
+        CGGetActiveDisplayList(activeCount, &activeDisplays, &activeCount)
+        let activeSet = Set(activeDisplays)
+        
+        #if DEBUG
+        print("📺 [DEBUG] Active displays count: \(activeCount)")
+        for id in activeDisplays {
+            print("   - Active ID: \(id) (Built-in: \(CGDisplayIsBuiltin(id) != 0))")
+        }
+        #endif
+        
+        // Get all online displays (includes disabled ones)
+        var onlineCount: UInt32 = 0
+        CGGetOnlineDisplayList(0, nil, &onlineCount)
+        var onlineDisplays = [CGDirectDisplayID](repeating: 0, count: Int(onlineCount))
+        CGGetOnlineDisplayList(onlineCount, &onlineDisplays, &onlineCount)
+        
+        #if DEBUG
+        print("📺 [DEBUG] Online displays count: \(onlineCount)")
+        for id in onlineDisplays {
+            print("   - Online ID: \(id) (Built-in: \(CGDisplayIsBuiltin(id) != 0), Active: \(activeSet.contains(id)))")
+        }
+        #endif
+        
         var new_displays: Set<DisplayInfo> = Set()
         
         let primaryDisplayID = CGMainDisplayID()
         
-        new_displays = Set(activeDisplays.compactMap { displayID in
+        // Add all online displays, marking inactive ones as disconnected
+        for displayID in onlineDisplays {
+            let isActive = activeSet.contains(displayID)
             var displayName = "Display \(displayID)"
-            if let screen = NSScreen.screens.first(where: { $0.displayID == displayID }) {
+            
+            if isActive, let screen = NSScreen.screens.first(where: { $0.displayID == displayID }) {
                 displayName = screen.localizedName
+            } else if CGDisplayIsBuiltin(displayID) != 0 {
+                displayName = "Built-in Display"
             }
-            return DisplayInfo(
+            
+            let state: DisplayState = isActive ? .active : .disconnected
+            
+            // Save built-in display ID for persistence
+            if CGDisplayIsBuiltin(displayID) != 0 {
+                savedBuiltInDisplayID = displayID
+            }
+            
+            new_displays.insert(DisplayInfo(
                 id: displayID,
                 name: displayName,
-                state: .active,
-                isPrimary: displayID == primaryDisplayID
-            )
-        })
+                state: state,
+                isPrimary: isActive && displayID == primaryDisplayID
+            ))
+        }
         
-        // Ensuring the off/pending displays are not "deleted" - manually adding them to the new list.
+        // If we have a saved built-in display ID and it's not in the list, add it as disconnected
+        // This handles the case where the display was disabled and the app was restarted
+        if let builtInID = savedBuiltInDisplayID,
+           !new_displays.contains(where: { $0.id == builtInID }) {
+            #if DEBUG
+            print("📺 [DEBUG] Restoring previously saved built-in display ID: \(builtInID)")
+            #endif
+            new_displays.insert(DisplayInfo(
+                id: builtInID,
+                name: "Built-in Retina Display",
+                state: .disconnected,
+                isPrimary: false
+            ))
+        }
+        
+        // Fallback: If no built-in display found yet, actively search for one
+        // MacBooks always have a built-in display even if it's disabled
+        if !new_displays.contains(where: { CGDisplayIsBuiltin($0.id) != 0 }) {
+            #if DEBUG
+            print("📺 [DEBUG] No built-in display detected, searching for it...")
+            #endif
+            
+            // Try display IDs 1-10 (built-in is typically ID 1 but could vary)
+            for testID in 1...10 {
+                let displayID = CGDirectDisplayID(testID)
+                if CGDisplayIsBuiltin(displayID) != 0 {
+                    #if DEBUG
+                    print("📺 [DEBUG] Found built-in display with ID: \(displayID)")
+                    #endif
+                    savedBuiltInDisplayID = displayID
+                    new_displays.insert(DisplayInfo(
+                        id: displayID,
+                        name: "Built-in Retina Display",
+                        state: .disconnected,
+                        isPrimary: false
+                    ))
+                    break
+                }
+            }
+        }
+        
+        // Ensuring the off/pending/disconnected displays are not "deleted" - manually adding them to the new list.
+        // This handles mirrored displays, displays in pending state, and disconnected displays
         for display in displays {
-            if display.state.isOff() || display.state == .pending {
+            if display.state == .mirrored || display.state == .pending || display.state == .disconnected {
                 display.isPrimary = false
                 new_displays.insert(display)
             }
@@ -62,6 +340,17 @@ class DisplaysViewModel: ObservableObject {
         }
         
         try! arrengementCache.cache()
+        
+        #if DEBUG
+        print("📺 [DEBUG] Found \(displays.count) displays:")
+        for display in displays {
+            let builtIn = CGDisplayIsBuiltin(display.id) != 0
+            print("   - \(display.name) (ID: \(display.id)) State: \(display.state) Primary: \(display.isPrimary) Built-in: \(builtIn)")
+        }
+        #endif
+        
+        // Check if auto-restore should be scheduled after fetching displays
+        scheduleAutoRestoreIfNeeded()
     }
     
     func disconnectDisplay(display: DisplayInfo) throws(DisplayError) {
@@ -260,4 +549,18 @@ extension NSScreen {
         let key = NSDeviceDescriptionKey("NSScreenNumber")
         return deviceDescription[key] as! CGDirectDisplayID
     }
+}
+
+// MARK: - Display Reconfiguration Callback
+
+/// Global callback function for display configuration changes
+/// This is required because CGDisplayRegisterReconfigurationCallback needs a C-style function pointer
+private func displayReconfigurationCallback(
+    display: CGDirectDisplayID,
+    flags: CGDisplayChangeSummaryFlags,
+    userInfo: UnsafeMutableRawPointer?
+) {
+    guard let userInfo = userInfo else { return }
+    let viewModel = Unmanaged<DisplaysViewModel>.fromOpaque(userInfo).takeUnretainedValue()
+    viewModel.handleDisplayReconfiguration(display: display, flags: flags)
 }

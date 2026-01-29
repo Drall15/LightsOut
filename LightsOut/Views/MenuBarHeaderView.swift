@@ -64,7 +64,7 @@ struct MenuBarHeader: View {
             }
             Spacer()
             VStack(spacing: 4) {
-                Image("MenubarIcon")
+                Image("menubarIcon")
                     .resizable()
                     .scaledToFit()
                     .frame(width: 43, height: 43)
